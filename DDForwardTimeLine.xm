@@ -131,6 +131,96 @@
 - (void)xxx_forwordTimeLine:(UIButton *)sender;
 @end
 
+static BOOL DDViewTreeContainsClassName(UIView *view, NSSet *classNames) {
+    if (!view) return NO;
+    if ([classNames containsObject:NSStringFromClass([view class])]) return YES;
+    for (UIView *subview in [view.subviews copy]) {
+        if (DDViewTreeContainsClassName(subview, classNames)) return YES;
+    }
+    return NO;
+}
+
+static BOOL DDViewHasAncestorClassName(UIView *view, NSSet *classNames) {
+    UIView *ancestor = view.superview;
+    while (ancestor) {
+        if ([classNames containsObject:NSStringFromClass([ancestor class])]) return YES;
+        ancestor = ancestor.superview;
+    }
+    return NO;
+}
+
+static BOOL DDIsForwardSightResidueContainer(UIView *view, UIWindow *window) {
+    if (!view || !window || view == window || view == window.rootViewController.view) return NO;
+    if (![NSStringFromClass([view class]) isEqualToString:@"UIView"]) return NO;
+
+    UIResponder *responder = view.nextResponder;
+    NSString *responderClassName = responder ? NSStringFromClass([responder class]) : nil;
+    if ([responderClassName hasSuffix:@"ViewController"]) return NO;
+
+    CGRect rect = [view convertRect:view.bounds toView:window];
+    BOOL fullscreenSize = CGRectGetWidth(rect) >= CGRectGetWidth(window.bounds) - 2.0
+                       && CGRectGetHeight(rect) >= CGRectGetHeight(window.bounds) - 2.0;
+    if (!fullscreenSize) return NO;
+
+    NSSet *timelineAncestorNames = [NSSet setWithObjects:@"UITableViewCellContentView", @"MMTableViewCell", @"WCTimeLineTableView", @"WCTimelineTableView", nil];
+    if (!DDViewHasAncestorClassName(view, timelineAncestorNames)) return NO;
+
+    NSSet *previewNames = [NSSet setWithObjects:@"WCPostSightImageView", @"SightIconView", nil];
+    if (!DDViewTreeContainsClassName(view, previewNames)) return NO;
+
+    NSSet *assetCellNames = [NSSet setWithObjects:@"UICollectionViewCell", nil];
+    if (!DDViewTreeContainsClassName(view, assetCellNames)) return NO;
+
+    NSSet *normalTimelineNames = [NSSet setWithObjects:@"WCTimeLineCellView", @"WCTimeLineTableView", @"WCTimelineTableView", @"MMTableViewCell", nil];
+    if (DDViewTreeContainsClassName(view, normalTimelineNames)) return NO;
+
+    return YES;
+}
+
+static void DDCollectForwardSightResidueContainers(UIView *view, UIWindow *window, NSMutableArray *result) {
+    if (!view) return;
+    if (DDIsForwardSightResidueContainer(view, window)) {
+        [result addObject:view];
+        return;
+    }
+    for (UIView *subview in [view.subviews copy]) {
+        DDCollectForwardSightResidueContainers(subview, window, result);
+    }
+}
+
+static void DDRemoveForwardSightResiduePreviewViews(void) {
+    NSMutableArray *targets = [NSMutableArray array];
+    NSMutableArray *windows = [NSMutableArray array];
+    UIWindow *keyWindow = [NSObject currentKeyWindow];
+    if (keyWindow) [windows addObject:keyWindow];
+    for (UIScene *scene in [[UIApplication sharedApplication].connectedScenes copy]) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in [((UIWindowScene *)scene).windows copy]) {
+            if (!window || window.hidden || window.alpha <= 0.0 || [windows containsObject:window]) continue;
+            [windows addObject:window];
+        }
+    }
+    for (UIWindow *window in windows) {
+        for (UIView *subview in [window.subviews copy]) {
+            DDCollectForwardSightResidueContainers(subview, window, targets);
+        }
+    }
+    for (UIView *target in targets) {
+        [target removeFromSuperview];
+    }
+}
+
+static void DDScheduleForwardSightResiduePreviewCleanup(void) {
+    DDRemoveForwardSightResiduePreviewViews();
+    NSArray *delays = @[@0.15, @0.45, @0.9, @1.6, @2.6, @4.0];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            DDRemoveForwardSightResiduePreviewViews();
+        });
+    }
+}
+
 #pragma mark - 配置管理
 
 static NSString * const kDDForwardEnabledKey = @"DDForward_Enabled";
@@ -848,7 +938,10 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
             if (isForwardModalNav) {
                 [navView removeFromSuperview];
             }
+            DDScheduleForwardSightResiduePreviewCleanup();
         };
+
+        DDScheduleForwardSightResiduePreviewCleanup();
 
         // 1) 先清理可能挂在 keyWindow/window 上的悬浮 view，这是“列表卡死”的真正元凶
         // 根据 WCNewCommitViewController 头文件，以下几个是发布完成后可能仍留在 keyWindow 上的独立 view
@@ -976,7 +1069,10 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             __strong __typeof(weakSelf) strongSelf = weakSelf;
-            if (strongSelf) [strongSelf dd_dismissForwardLaunched];
+            if (strongSelf) {
+                DDScheduleForwardSightResiduePreviewCleanup();
+                [strongSelf dd_dismissForwardLaunched];
+            }
         });
     }
 }
@@ -989,7 +1085,10 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             __strong __typeof(weakSelf) strongSelf = weakSelf;
-            if (strongSelf) [strongSelf dd_dismissForwardLaunched];
+            if (strongSelf) {
+                DDScheduleForwardSightResiduePreviewCleanup();
+                [strongSelf dd_dismissForwardLaunched];
+            }
         });
     }
 }
@@ -1023,7 +1122,10 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 __strong __typeof(weakInner) inner = weakInner;
-                if (inner) [inner dd_dismissForwardLaunched];
+                if (inner) {
+                    DDScheduleForwardSightResiduePreviewCleanup();
+                    [inner dd_dismissForwardLaunched];
+                }
             });
         }
     }];
