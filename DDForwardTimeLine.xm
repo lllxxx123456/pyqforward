@@ -57,6 +57,16 @@
 - (instancetype)initWithDataItem:(WCDataItem *)dataItem;
 @end
 
+// 朝友圈发布 VC（视频发布入口）——为 hook 中的 self 提供完整接口声明，避免前向声明导致的 forward declaration 编译错误
+@interface WCNewCommitViewController : UIViewController
+- (BOOL)dd_isLaunchedByForward;
+- (void)dd_dismissForwardLaunched;
+- (void)didFinishCommiting;
+- (void)didCancelCommiting;
+- (void)OnReturn;
+- (void)doExit;
+@end
+
 // 朋友圈内容与媒体
 @interface WCContentItem : NSObject
 - (NSArray *)mediaList;
@@ -820,7 +830,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         UINavigationController *nav = self.navigationController;
         if (nav) {
             // VC 是 nav 根视图：把整个 nav modal 关闭；否则 pop 自身
-            if (nav.viewControllers.count > 0 && nav.viewControllers.firstObject == self) {
+            if (nav.viewControllers.count > 0 && nav.viewControllers.firstObject == (UIViewController *)self) {
                 if (nav.presentingViewController) {
                     [nav dismissViewControllerAnimated:YES completion:nil];
                 } else {
