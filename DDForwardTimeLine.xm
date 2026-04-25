@@ -131,6 +131,20 @@
 - (void)xxx_forwordTimeLine:(UIButton *)sender;
 @end
 
+static NSTimeInterval gDDForwardSightResidueCleanupDeadline = 0;
+
+static void DDEnableForwardSightResidueCleanupWindow(NSTimeInterval seconds) {
+    NSTimeInterval deadline = [[NSDate date] timeIntervalSince1970] + seconds;
+    if (deadline > gDDForwardSightResidueCleanupDeadline) {
+        gDDForwardSightResidueCleanupDeadline = deadline;
+    }
+}
+
+static BOOL DDShouldCleanForwardSightResidueNow(void) {
+    return gDDForwardSightResidueCleanupDeadline > 0
+        && [[NSDate date] timeIntervalSince1970] <= gDDForwardSightResidueCleanupDeadline;
+}
+
 static BOOL DDViewTreeContainsClassName(UIView *view, NSSet *classNames) {
     if (!view) return NO;
     if ([classNames containsObject:NSStringFromClass([view class])]) return YES;
@@ -162,7 +176,7 @@ static BOOL DDIsForwardSightResidueContainer(UIView *view, UIWindow *window) {
                        && CGRectGetHeight(rect) >= CGRectGetHeight(window.bounds) - 2.0;
     if (!fullscreenSize) return NO;
 
-    NSSet *timelineAncestorNames = [NSSet setWithObjects:@"UITableViewCellContentView", @"MMTableViewCell", @"WCTimeLineTableView", @"WCTimelineTableView", nil];
+    NSSet *timelineAncestorNames = [NSSet setWithObjects:@"UITableViewCellContentView", @"MMTableViewCell", @"WCListHeaderView", @"WCTimeLineTableView", @"WCTimelineTableView", nil];
     if (!DDViewHasAncestorClassName(view, timelineAncestorNames)) return NO;
 
     NSSet *previewNames = [NSSet setWithObjects:@"WCPostSightImageView", @"SightIconView", nil];
@@ -211,6 +225,7 @@ static void DDRemoveForwardSightResiduePreviewViews(void) {
 }
 
 static void DDScheduleForwardSightResiduePreviewCleanup(void) {
+    DDEnableForwardSightResidueCleanupWindow(20.0);
     DDRemoveForwardSightResiduePreviewViews();
     NSArray *delays = @[@0.15, @0.45, @0.9, @1.6, @2.6, @4.0];
     for (NSNumber *delay in delays) {
@@ -914,6 +929,29 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 %end
 
+#pragma mark - Hook UIView：发布后精准清理朋友圈表头残留的视频预览覆盖层
+
+%hook UIView
+
+- (void)didMoveToSuperview {
+    %orig;
+    if (!DDShouldCleanForwardSightResidueNow()) return;
+    if (![NSStringFromClass([self class]) isEqualToString:@"UIView"]) return;
+
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !DDShouldCleanForwardSightResidueNow()) return;
+        UIWindow *window = strongSelf.window;
+        if (!window) window = [NSObject currentKeyWindow];
+        if (DDIsForwardSightResidueContainer(strongSelf, window)) {
+            [strongSelf removeFromSuperview];
+        }
+    });
+}
+
+%end
+
 #pragma mark - Hook 视频发布 VC：转发启动的实例发布/取消/返回时自动退出（避免卡死）
 
 %hook WCNewCommitViewController
@@ -1063,6 +1101,9 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 // %orig 运行后延迟主动强制 dismiss，与后台 SnsService 上传完全解耦。
 - (void)OnDone {
     BOOL isForward = [self dd_isLaunchedByForward];
+    if (isForward) {
+        DDScheduleForwardSightResiduePreviewCleanup();
+    }
     %orig;
     if (isForward) {
         __weak __typeof(self) weakSelf = self;
@@ -1079,6 +1120,9 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 - (void)postNewItemForSight {
     BOOL isForward = [self dd_isLaunchedByForward];
+    if (isForward) {
+        DDScheduleForwardSightResiduePreviewCleanup();
+    }
     %orig;
     if (isForward) {
         __weak __typeof(self) weakSelf = self;
@@ -1118,6 +1162,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         if (clicked) {
             [t invalidate];
             objc_setAssociatedObject(strongSelf, kWatcherKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            DDScheduleForwardSightResiduePreviewCleanup();
             __weak __typeof(strongSelf) weakInner = strongSelf;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
