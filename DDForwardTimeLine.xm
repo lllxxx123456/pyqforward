@@ -151,7 +151,7 @@ static NSString *DDKVCValueSummary(id obj, NSString *key);
 
 static BOOL DDIsDDForwardDebugWindow(UIWindow *window) {
     if (!window) return NO;
-    if (window == gDDForwardDebugWindow) return YES;
+    if (window == (UIWindow *)gDDForwardDebugWindow) return YES;
     return [NSStringFromClass([window class]) isEqualToString:@"DDForwardDebugWindow"];
 }
 
