@@ -149,6 +149,41 @@ static void DDDebugHide(void);
 static NSString *DDObjectSummary(id obj);
 static NSString *DDKVCValueSummary(id obj, NSString *key);
 
+static BOOL DDIsDDForwardDebugWindow(UIWindow *window) {
+    if (!window) return NO;
+    if (window == gDDForwardDebugWindow) return YES;
+    return [NSStringFromClass([window class]) isEqualToString:@"DDForwardDebugWindow"];
+}
+
+static BOOL DDIsVisibleNonDebugWindow(UIWindow *window) {
+    return window && !DDIsDDForwardDebugWindow(window) && !window.hidden && window.alpha > 0.0;
+}
+
+static NSArray *DDVisibleNonDebugWindows(void) {
+    NSMutableArray *windows = [NSMutableArray array];
+    for (UIScene *scene in [[UIApplication sharedApplication].connectedScenes copy]) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        UIWindow *keyWindow = windowScene.keyWindow;
+        if (DDIsVisibleNonDebugWindow(keyWindow) && ![windows containsObject:keyWindow]) {
+            [windows addObject:keyWindow];
+        }
+        for (UIWindow *window in [windowScene.windows copy]) {
+            if (!DDIsVisibleNonDebugWindow(window) || [windows containsObject:window]) continue;
+            [windows addObject:window];
+        }
+    }
+    return windows;
+}
+
+static UIWindow *DDActiveApplicationWindow(void) {
+    NSArray *windows = DDVisibleNonDebugWindows();
+    for (UIWindow *window in windows) {
+        if (window.rootViewController) return window;
+    }
+    return windows.count > 0 ? [windows objectAtIndex:0] : nil;
+}
+
 static NSTimeInterval gDDForwardSightResidueCleanupDeadline = 0;
 
 static void DDEnableForwardSightResidueCleanupWindow(NSTimeInterval seconds) {
@@ -222,16 +257,7 @@ static void DDCollectForwardSightResidueContainers(UIView *view, UIWindow *windo
 
 static void DDRemoveForwardSightResiduePreviewViews(void) {
     NSMutableArray *targets = [NSMutableArray array];
-    NSMutableArray *windows = [NSMutableArray array];
-    UIWindow *keyWindow = [NSObject currentKeyWindow];
-    if (keyWindow) [windows addObject:keyWindow];
-    for (UIScene *scene in [[UIApplication sharedApplication].connectedScenes copy]) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *window in [((UIWindowScene *)scene).windows copy]) {
-            if (!window || window.hidden || window.alpha <= 0.0 || [windows containsObject:window]) continue;
-            [windows addObject:window];
-        }
-    }
+    NSArray *windows = DDVisibleNonDebugWindows();
     for (UIWindow *window in windows) {
         for (UIView *subview in [window.subviews copy]) {
             DDCollectForwardSightResidueContainers(subview, window, targets);
@@ -267,9 +293,20 @@ static void DDScheduleForwardSightResiduePreviewCleanup(void) {
 
 @implementation DDForwardDebugWindow
 
+- (BOOL)canBecomeKeyWindow {
+    return NO;
+}
+
+- (void)makeKeyWindow {
+}
+
+- (void)makeKeyAndVisible {
+    self.hidden = NO;
+}
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    if (!hit || hit == self) return nil;
+    if (hit == self) return nil;
     if (gDDForwardDebugPanel && !gDDForwardDebugPanel.hidden) {
         CGPoint p = [gDDForwardDebugPanel convertPoint:point fromView:self];
         if ([gDDForwardDebugPanel pointInside:p withEvent:event]) return hit;
@@ -489,7 +526,7 @@ static void DDDebugShow(void) {
         if (gDDForwardDebugUserClosed) return;
         if (!gDDForwardDebugBuffer) gDDForwardDebugBuffer = [NSMutableString string];
         if (!gDDForwardDebugWindow) {
-            UIWindow *base = [NSObject currentKeyWindow];
+            UIWindow *base = DDActiveApplicationWindow();
             CGRect bounds = base ? base.bounds : [UIScreen mainScreen].bounds;
             gDDForwardDebugWindow = [[DDForwardDebugWindow alloc] initWithFrame:bounds];
             if (base && base.windowScene) {
@@ -544,18 +581,9 @@ static void DDDebugCaptureState(NSString *reason) {
     dispatch_async(dispatch_get_main_queue(), ^{
         DDDebugLog(@"---- capture: %@ ----", reason ? reason : @"unknown");
         NSMutableString *snapshot = [NSMutableString string];
-        UIWindow *keyWindow = [NSObject currentKeyWindow];
+        UIWindow *keyWindow = DDActiveApplicationWindow();
         [snapshot appendFormat:@"keyWindow: %@\n", DDObjectSummary(keyWindow)];
-        NSMutableArray *windows = [NSMutableArray array];
-        if (keyWindow) [windows addObject:keyWindow];
-        for (UIScene *scene in [[UIApplication sharedApplication].connectedScenes copy]) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *window in [((UIWindowScene *)scene).windows copy]) {
-                if (window == gDDForwardDebugWindow) continue;
-                if (!window || [windows containsObject:window]) continue;
-                [windows addObject:window];
-            }
-        }
+        NSArray *windows = DDVisibleNonDebugWindows();
         NSUInteger wi = 0;
         for (UIWindow *window in windows) {
             [snapshot appendFormat:@"window[%lu]: %@\n", (unsigned long)wi, DDObjectSummary(window)];
@@ -704,8 +732,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 @implementation NSObject (ForwardHelper)
 
 + (UIWindow *)currentKeyWindow {
-    UIWindowScene *scene = (UIWindowScene *)[UIApplication sharedApplication].connectedScenes.allObjects.firstObject;
-    return scene.keyWindow;
+    return DDActiveApplicationWindow();
 }
 
 - (void)showLoadingHUD {
@@ -1421,9 +1448,8 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
             }
         } @catch (__unused NSException *e) {}
         
-        // 4) 兑底清掉 keyWindow 上任何“集中全屏遮罩”（alpha 在透明区间、frame 覆盖整个窗口、且不是 rootViewController.view）
-        UIWindow *kw = [NSObject currentKeyWindow];
-        if (kw) {
+        // 4) 兑底清掉真实窗口上任何“集中全屏遮罩”（alpha 在透明区间、frame 覆盖整个窗口、且不是 rootViewController.view）
+        for (UIWindow *kw in DDVisibleNonDebugWindows()) {
             UIView *rootView = kw.rootViewController.view;
             for (UIView *sv in [kw.subviews copy]) {
                 if (sv == rootView) continue;
