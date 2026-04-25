@@ -106,6 +106,9 @@
 - (UIImage *)dd_localThumbImageForMediaItem:(id)mediaItem;
 - (Class)dd_findSightEditVCClass;
 - (UIViewController *)dd_instantiateSightEditVC:(Class)editCls localPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage;
+- (id)dd_buildSightDraftWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage;
+- (id)dd_buildMMAssetWithLocalPath:(NSString *)localPath;
+- (BOOL)dd_presentEditVC:(UIViewController *)editVC;
 - (BOOL)dd_tryForwardSightWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage;
 - (void)xxx_forwordTimeLine:(UIButton *)sender;
 @end
@@ -486,45 +489,106 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     return vc;
 }
 
-- (BOOL)dd_tryForwardSightWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
-    Class editCls = [self dd_findSightEditVCClass];
-    if (!editCls) return NO;
+#pragma mark - SightDraft / MMAsset 构造器（根据 FLEX 实测：微信发布视频朝友圈使用 SightDraft + initWithSightDraft:）
+
+- (id)dd_buildSightDraftWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
+    Class draftCls = NSClassFromString(@"SightDraft");
+    if (!draftCls) return nil;
     
-    UIViewController *editVC = [self dd_instantiateSightEditVC:editCls localPath:localPath thumbImage:thumbImage];
-    if (!editVC) return NO;
+    id draft = nil;
     
-    // init 后再用 setter 兜底注入视频路径与缩略图（兼容只能 init 不带参数初始化的版本）
-    NSArray *pathSetters = @[@"setRealMoviePath:", @"setMoviePath:", @"setVideoPath:", @"setSightPath:", @"setLocalPath:", @"setSightVideoPath:", @"setRealVideoPath:"];
-    for (NSString *selStr in pathSetters) {
+    // 尝试多种常见的 init 签名
+    NSArray *initWithPathThumb = @[
+        @"initWithVideoPath:thumbImage:",
+        @"initWithMoviePath:thumbImage:",
+        @"initWithLocalVideoPath:thumbImage:",
+        @"initWithSightPath:thumbImage:",
+    ];
+    for (NSString *selStr in initWithPathThumb) {
         SEL s = NSSelectorFromString(selStr);
-        if ([editVC respondsToSelector:s]) {
-            @try { ((void (*)(id, SEL, id))objc_msgSend)(editVC, s, localPath); } @catch (__unused NSException *e) {}
+        if ([draftCls instancesRespondToSelector:s]) {
+            @try {
+                draft = ((id (*)(id, SEL, id, id))objc_msgSend)([draftCls alloc], s, localPath, thumbImage ?: (id)[NSNull null]);
+                if (draft) break;
+            } @catch (__unused NSException *e) {}
         }
     }
-    if (thumbImage) {
-        NSArray *thumbSetters = @[@"setRealThumbImage:", @"setThumbImage:", @"setThumb:", @"setCoverImage:", @"setSightThumbImage:"];
-        for (NSString *selStr in thumbSetters) {
+    
+    if (!draft) {
+        NSArray *initWithPathOnly = @[
+            @"initWithLocalVideoPath:",
+            @"initWithVideoPath:",
+            @"initWithMoviePath:",
+            @"initWithLocalPath:",
+            @"initWithSightPath:",
+            @"initWithPath:",
+        ];
+        for (NSString *selStr in initWithPathOnly) {
             SEL s = NSSelectorFromString(selStr);
-            if ([editVC respondsToSelector:s]) {
-                @try { ((void (*)(id, SEL, id))objc_msgSend)(editVC, s, thumbImage); } @catch (__unused NSException *e) {}
+            if ([draftCls instancesRespondToSelector:s]) {
+                @try {
+                    draft = ((id (*)(id, SEL, id))objc_msgSend)([draftCls alloc], s, localPath);
+                    if (draft) break;
+                } @catch (__unused NSException *e) {}
             }
         }
     }
     
-    // 统一发布 VC 可能需要"标记为视频发布模式"（多种字段名兼容）
-    NSArray *modeSetters = @[@"setM_uiCommitType:", @"setUiCommitType:", @"setM_dataType:", @"setDataType:"];
-    for (NSString *selStr in modeSetters) {
-        SEL s = NSSelectorFromString(selStr);
-        if ([editVC respondsToSelector:s]) {
-            @try { ((void (*)(id, SEL, NSInteger))objc_msgSend)(editVC, s, (NSInteger)1); } @catch (__unused NSException *e) {}
+    // 兜底：默认 init 后通过 KVC 注入路径与缩略图
+    if (!draft) {
+        @try { draft = [[draftCls alloc] init]; } @catch (__unused NSException *e) {}
+    }
+    
+    if (draft) {
+        NSArray *pathKeys = @[@"videoPath", @"moviePath", @"realMoviePath", @"localPath", @"localVideoPath", @"path", @"sightPath", @"realLocalPath", @"m_videoPath", @"m_moviePath", @"m_localPath"];
+        for (NSString *k in pathKeys) {
+            @try { [draft setValue:localPath forKey:k]; } @catch (__unused NSException *e) {}
+        }
+        if (thumbImage) {
+            NSArray *thumbKeys = @[@"thumbImage", @"realThumbImage", @"coverImage", @"firstFrame", @"m_thumbImage"];
+            for (NSString *k in thumbKeys) {
+                @try { [draft setValue:thumbImage forKey:k]; } @catch (__unused NSException *e) {}
+            }
         }
     }
     
-    SEL makeSel = NSSelectorFromString(@"makeInputController");
-    if ([editVC respondsToSelector:makeSel]) {
-        @try { ((void (*)(id, SEL))objc_msgSend)(editVC, makeSel); } @catch (__unused NSException *e) {}
-    }
+    return draft;
+}
+
+- (id)dd_buildMMAssetWithLocalPath:(NSString *)localPath {
+    Class assetCls = NSClassFromString(@"MMAsset");
+    if (!assetCls) return nil;
     
+    id asset = nil;
+    NSArray *attempts = @[
+        @"initWithLocalVideoPath:",
+        @"initWithVideoPath:",
+        @"initWithLocalPath:",
+        @"initWithPath:",
+        @"initWithFilePath:",
+    ];
+    for (NSString *selStr in attempts) {
+        SEL s = NSSelectorFromString(selStr);
+        if ([assetCls instancesRespondToSelector:s]) {
+            @try {
+                asset = ((id (*)(id, SEL, id))objc_msgSend)([assetCls alloc], s, localPath);
+                if (asset) break;
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    if (!asset) {
+        @try { asset = [[assetCls alloc] init]; } @catch (__unused NSException *e) {}
+    }
+    if (asset) {
+        NSArray *pathKeys = @[@"videoPath", @"localPath", @"localVideoPath", @"path", @"filePath", @"m_videoPath", @"m_localPath"];
+        for (NSString *k in pathKeys) {
+            @try { [asset setValue:localPath forKey:k]; } @catch (__unused NSException *e) {}
+        }
+    }
+    return asset;
+}
+
+- (BOOL)dd_presentEditVC:(UIViewController *)editVC {
     UIViewController *presenter = nil;
     UINavigationController *nav = nil;
     @try { nav = [self valueForKey:@"navigationController"]; } @catch (__unused NSException *e) {}
@@ -545,6 +609,86 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         [presenter presentViewController:wrap animated:YES completion:nil];
     }
     return YES;
+}
+
+- (BOOL)dd_tryForwardSightWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
+    Class commitCls = NSClassFromString(@"WCNewCommitViewController");
+    if (!commitCls) {
+        commitCls = [self dd_findSightEditVCClass];
+    }
+    if (!commitCls) return NO;
+    
+    // 1) 优先构造 SightDraft（微信视频发布的标准载体）
+    id sightDraft = [self dd_buildSightDraftWithLocalPath:localPath thumbImage:thumbImage];
+    
+    // 2) MMAsset 作为备选载体
+    id sightAsset = [self dd_buildMMAssetWithLocalPath:localPath];
+    
+    // 3) 首选用 initWithSightDraft: 初始化 VC
+    UIViewController *editVC = nil;
+    if (sightDraft) {
+        SEL s = NSSelectorFromString(@"initWithSightDraft:");
+        if ([commitCls instancesRespondToSelector:s]) {
+            @try {
+                editVC = ((id (*)(id, SEL, id))objc_msgSend)([commitCls alloc], s, sightDraft);
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    
+    // 4) 其次 initWithTextType（type=3 为视频模式，根据 FLEX 抹到的当前发布页 type=3）
+    if (!editVC) {
+        SEL s = NSSelectorFromString(@"initWithTextType:");
+        if ([commitCls instancesRespondToSelector:s]) {
+            @try {
+                editVC = ((id (*)(id, SEL, NSUInteger))objc_msgSend)([commitCls alloc], s, (NSUInteger)3);
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    
+    // 5) 并业其他候选 init 路径
+    if (!editVC) {
+        editVC = [self dd_instantiateSightEditVC:commitCls localPath:localPath thumbImage:thumbImage];
+    }
+    if (!editVC) return NO;
+    
+    // 6) 如果初始化后 sightDraft 没被设进去，手动 setSightDraft
+    if (sightDraft) {
+        SEL s = NSSelectorFromString(@"setSightDraft:");
+        if ([editVC respondsToSelector:s]) {
+            @try { ((void (*)(id, SEL, id))objc_msgSend)(editVC, s, sightDraft); } @catch (__unused NSException *e) {}
+        }
+    }
+    if (sightAsset) {
+        SEL s = NSSelectorFromString(@"setSightAsset:");
+        if ([editVC respondsToSelector:s]) {
+            @try { ((void (*)(id, SEL, id))objc_msgSend)(editVC, s, sightAsset); } @catch (__unused NSException *e) {}
+        }
+    }
+    
+    // 7) 设置 type=3（视频发布模式）
+    SEL setTypeSel = NSSelectorFromString(@"setType:");
+    if ([editVC respondsToSelector:setTypeSel]) {
+        @try { ((void (*)(id, SEL, NSUInteger))objc_msgSend)(editVC, setTypeSel, (NSUInteger)3); } @catch (__unused NSException *e) {}
+    }
+    
+    // 8) 通过 ivar 直接设置缩略图（FLEX 抹到 _sightThumbImage 为 ivar）
+    if (thumbImage) {
+        Ivar thumbIvar = class_getInstanceVariable(commitCls, "_sightThumbImage");
+        if (thumbIvar) {
+            @try { object_setIvar(editVC, thumbIvar, thumbImage); } @catch (__unused NSException *e) {}
+        }
+        SEL setThumbSel = NSSelectorFromString(@"setM_sightThumbImage:");
+        if ([editVC respondsToSelector:setThumbSel]) {
+            @try { ((void (*)(id, SEL, id))objc_msgSend)(editVC, setThumbSel, thumbImage); } @catch (__unused NSException *e) {}
+        }
+    }
+    
+    // 9) 标记为使用 MMAsset（FLEX 看到存在 m_isUseMMAsset 字段）
+    if (sightAsset) {
+        @try { [editVC setValue:@YES forKey:@"m_isUseMMAsset"]; } @catch (__unused NSException *e) {}
+    }
+    
+    return [self dd_presentEditVC:editVC];
 }
 
 @end
