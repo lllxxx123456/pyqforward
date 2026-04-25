@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <stdarg.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -69,6 +70,8 @@
 - (void)OnDone;
 - (void)postNewItemForSight;
 - (void)doExit;
+- (void)viewWillDisappear:(BOOL)animated;
+- (void)viewDidDisappear:(BOOL)animated;
 - (void)viewDidAppear:(BOOL)animated;
 @end
 
@@ -130,6 +133,21 @@
 - (void)dd_startWatchHasClickDone;
 - (void)xxx_forwordTimeLine:(UIButton *)sender;
 @end
+
+@class DDForwardDebugWindow;
+@class DDForwardDebugPanel;
+static NSMutableString *gDDForwardDebugBuffer = nil;
+static DDForwardDebugWindow *gDDForwardDebugWindow = nil;
+static DDForwardDebugPanel *gDDForwardDebugPanel = nil;
+static BOOL gDDForwardDebugUserClosed = NO;
+static void DDDebugStartSession(NSString *reason);
+static void DDDebugLog(NSString *format, ...);
+static void DDDebugCaptureState(NSString *reason);
+static void DDDebugScheduleCaptures(NSString *reason);
+static void DDDebugShow(void);
+static void DDDebugHide(void);
+static NSString *DDObjectSummary(id obj);
+static NSString *DDKVCValueSummary(id obj, NSString *key);
 
 static NSTimeInterval gDDForwardSightResidueCleanupDeadline = 0;
 
@@ -220,6 +238,7 @@ static void DDRemoveForwardSightResiduePreviewViews(void) {
         }
     }
     for (UIView *target in targets) {
+        DDDebugLog(@"remove residue target: %@", DDObjectSummary(target));
         [target removeFromSuperview];
     }
 }
@@ -232,6 +251,338 @@ static void DDScheduleForwardSightResiduePreviewCleanup(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             DDRemoveForwardSightResiduePreviewViews();
+        });
+    }
+}
+
+@interface DDForwardDebugWindow : UIWindow
+@end
+
+@interface DDForwardDebugPanel : UIView
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UIButton *minButton;
+@property (nonatomic, assign) BOOL minimized;
+- (void)refreshText;
+@end
+
+@implementation DDForwardDebugWindow
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (!hit || hit == self) return nil;
+    if (gDDForwardDebugPanel && !gDDForwardDebugPanel.hidden) {
+        CGPoint p = [gDDForwardDebugPanel convertPoint:point fromView:self];
+        if ([gDDForwardDebugPanel pointInside:p withEvent:event]) return hit;
+    }
+    return nil;
+}
+
+@end
+
+@implementation DDForwardDebugPanel
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (self = [super initWithFrame:frame]) {
+        self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
+        self.layer.cornerRadius = 10.0;
+        self.layer.borderWidth = 1.0;
+        self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+        self.clipsToBounds = YES;
+
+        NSArray *titles = @[@"最小", @"抓取", @"复制", @"清空", @"关闭"];
+        NSArray *actions = @[
+            NSStringFromSelector(@selector(onMinimize)),
+            NSStringFromSelector(@selector(onCapture)),
+            NSStringFromSelector(@selector(onCopy)),
+            NSStringFromSelector(@selector(onClear)),
+            NSStringFromSelector(@selector(onClose))
+        ];
+        for (NSUInteger i = 0; i < titles.count; i++) {
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+            [btn setTitle:titles[i] forState:UIControlStateNormal];
+            [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            btn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+            btn.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.12];
+            btn.layer.cornerRadius = 5.0;
+            [btn addTarget:self action:NSSelectorFromString(actions[i]) forControlEvents:UIControlEventTouchUpInside];
+            [self addSubview:btn];
+            if (i == 0) self.minButton = btn;
+        }
+
+        self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
+        self.textView.editable = NO;
+        self.textView.selectable = YES;
+        self.textView.backgroundColor = [UIColor clearColor];
+        self.textView.textColor = [UIColor colorWithWhite:0.96 alpha:1.0];
+        self.textView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+        self.textView.alwaysBounceVertical = YES;
+        [self addSubview:self.textView];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
+        [self addGestureRecognizer:pan];
+    }
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat pad = 8.0;
+    CGFloat buttonH = 28.0;
+    CGFloat gap = 5.0;
+    CGFloat buttonW = (self.bounds.size.width - pad * 2 - gap * 4) / 5.0;
+    NSUInteger index = 0;
+    for (UIView *subview in self.subviews) {
+        if (![subview isKindOfClass:[UIButton class]]) continue;
+        subview.frame = CGRectMake(pad + index * (buttonW + gap), pad, buttonW, buttonH);
+        index++;
+    }
+    self.textView.frame = CGRectMake(pad, pad + buttonH + pad, self.bounds.size.width - pad * 2, self.bounds.size.height - buttonH - pad * 3);
+}
+
+- (void)refreshText {
+    self.textView.text = gDDForwardDebugBuffer ? gDDForwardDebugBuffer : @"";
+    if (self.textView.text.length > 0) {
+        [self.textView scrollRangeToVisible:NSMakeRange(self.textView.text.length - 1, 1)];
+    }
+}
+
+- (void)onMinimize {
+    self.minimized = !self.minimized;
+    CGRect f = self.frame;
+    if (self.minimized) {
+        f.size.height = 44.0;
+        self.textView.hidden = YES;
+        [self.minButton setTitle:@"展开" forState:UIControlStateNormal];
+    } else {
+        f.size.height = 300.0;
+        self.textView.hidden = NO;
+        [self.minButton setTitle:@"最小" forState:UIControlStateNormal];
+    }
+    self.frame = f;
+    [self setNeedsLayout];
+}
+
+- (void)onCapture {
+    DDDebugCaptureState(@"manual-capture");
+}
+
+- (void)onCopy {
+    [UIPasteboard generalPasteboard].string = gDDForwardDebugBuffer ? gDDForwardDebugBuffer : @"";
+}
+
+- (void)onClear {
+    [gDDForwardDebugBuffer setString:@""];
+    [self refreshText];
+}
+
+- (void)onClose {
+    gDDForwardDebugUserClosed = YES;
+    DDDebugHide();
+}
+
+- (void)onPan:(UIPanGestureRecognizer *)pan {
+    CGPoint delta = [pan translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + delta.x, self.center.y + delta.y);
+    [pan setTranslation:CGPointZero inView:self.superview];
+    if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
+        CGRect bounds = self.superview.bounds;
+        CGRect f = self.frame;
+        f.origin.x = MAX(6.0, MIN(f.origin.x, bounds.size.width - f.size.width - 6.0));
+        f.origin.y = MAX(40.0, MIN(f.origin.y, bounds.size.height - f.size.height - 20.0));
+        self.frame = f;
+    }
+}
+
+@end
+
+static NSString *DDFrameString(UIView *view) {
+    if (!view) return @"nil";
+    return NSStringFromCGRect(view.frame);
+}
+
+static UIViewController *DDNearestViewControllerForView(UIView *view) {
+    UIResponder *responder = view.nextResponder;
+    while (responder) {
+        if ([responder isKindOfClass:[UIViewController class]]) return (UIViewController *)responder;
+        responder = responder.nextResponder;
+    }
+    return nil;
+}
+
+static NSString *DDObjectSummary(id obj) {
+    if (!obj) return @"nil";
+    NSString *className = NSStringFromClass([obj class]);
+    NSString *ptr = [NSString stringWithFormat:@"%p", obj];
+    if ([obj isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)obj;
+        UIViewController *vc = DDNearestViewControllerForView(v);
+        return [NSString stringWithFormat:@"%@<%@> frame=%@ hidden=%d alpha=%.2f user=%d super=%@ next=%@ nearVC=%@",
+                className, ptr, NSStringFromCGRect(v.frame), v.hidden, v.alpha, v.userInteractionEnabled,
+                v.superview ? NSStringFromClass([v.superview class]) : @"nil",
+                v.nextResponder ? NSStringFromClass([v.nextResponder class]) : @"nil",
+                vc ? NSStringFromClass([vc class]) : @"nil"];
+    }
+    if ([obj isKindOfClass:[UIViewController class]]) {
+        UIViewController *vc = (UIViewController *)obj;
+        return [NSString stringWithFormat:@"%@<%@> view=%@ nav=%@ presenting=%@ presented=%@",
+                className, ptr, DDFrameString(vc.view),
+                vc.navigationController ? NSStringFromClass([vc.navigationController class]) : @"nil",
+                vc.presentingViewController ? NSStringFromClass([vc.presentingViewController class]) : @"nil",
+                vc.presentedViewController ? NSStringFromClass([vc.presentedViewController class]) : @"nil"];
+    }
+    return [NSString stringWithFormat:@"%@<%@>", className, ptr];
+}
+
+static NSString *DDKVCValueSummary(id obj, NSString *key) {
+    if (!obj || key.length == 0) return @"nil";
+    @try {
+        id value = [obj valueForKey:key];
+        if (!value) return @"nil";
+        if ([value isKindOfClass:[NSString class]]) return (NSString *)value;
+        if ([value isKindOfClass:[NSNumber class]]) return [(NSNumber *)value stringValue];
+        if ([value isKindOfClass:[NSArray class]]) return [NSString stringWithFormat:@"%@ count=%lu", NSStringFromClass([value class]), (unsigned long)[(NSArray *)value count]];
+        return DDObjectSummary(value);
+    } @catch (__unused NSException *e) {
+        return @"<KVC failed>";
+    }
+}
+
+static void DDAppendViewTree(NSMutableString *out, UIView *view, NSUInteger depth, NSUInteger maxDepth) {
+    if (!view || depth > maxDepth) return;
+    NSMutableString *indent = [NSMutableString string];
+    for (NSUInteger i = 0; i < depth; i++) [indent appendString:@"  "];
+    UIViewController *vc = DDNearestViewControllerForView(view);
+    [out appendFormat:@"%@- %@ frame=%@ hidden=%d alpha=%.2f user=%d next=%@ nearVC=%@\n",
+     indent,
+     NSStringFromClass([view class]),
+     NSStringFromCGRect(view.frame),
+     view.hidden,
+     view.alpha,
+     view.userInteractionEnabled,
+     view.nextResponder ? NSStringFromClass([view.nextResponder class]) : @"nil",
+     vc ? NSStringFromClass([vc class]) : @"nil"];
+    for (UIView *subview in [view.subviews copy]) {
+        DDAppendViewTree(out, subview, depth + 1, maxDepth);
+    }
+}
+
+static BOOL DDViewLooksRelevantForForwardDebug(UIView *view) {
+    if (!view) return NO;
+    NSSet *names = [NSSet setWithObjects:@"WCPostSightImageView", @"SightIconView", @"WCAssetStateView", @"UICollectionViewCell", @"WCListHeaderView", @"WCTimelineTableView", @"WCTimeLineTableView", @"WCNewCommitViewController", nil];
+    if (DDViewTreeContainsClassName(view, names)) return YES;
+    if ([names containsObject:NSStringFromClass([view class])]) return YES;
+    return NO;
+}
+
+static void DDCollectRelevantViews(UIView *view, NSMutableArray *result) {
+    if (!view) return;
+    if (DDViewLooksRelevantForForwardDebug(view)) {
+        [result addObject:view];
+    }
+    for (UIView *subview in [view.subviews copy]) {
+        DDCollectRelevantViews(subview, result);
+    }
+}
+
+static void DDDebugShow(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gDDForwardDebugUserClosed) return;
+        if (!gDDForwardDebugBuffer) gDDForwardDebugBuffer = [NSMutableString string];
+        if (!gDDForwardDebugWindow) {
+            UIWindow *base = [NSObject currentKeyWindow];
+            CGRect bounds = base ? base.bounds : [UIScreen mainScreen].bounds;
+            gDDForwardDebugWindow = [[DDForwardDebugWindow alloc] initWithFrame:bounds];
+            if (base && base.windowScene) {
+                gDDForwardDebugWindow.windowScene = base.windowScene;
+            }
+            gDDForwardDebugWindow.windowLevel = UIWindowLevelAlert + 300;
+            gDDForwardDebugWindow.backgroundColor = [UIColor clearColor];
+            gDDForwardDebugWindow.hidden = NO;
+            gDDForwardDebugPanel = [[DDForwardDebugPanel alloc] initWithFrame:CGRectMake(10, 90, bounds.size.width - 20, 300)];
+            [gDDForwardDebugWindow addSubview:gDDForwardDebugPanel];
+        }
+        gDDForwardDebugWindow.hidden = NO;
+        [gDDForwardDebugPanel refreshText];
+    });
+}
+
+static void DDDebugHide(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gDDForwardDebugWindow.hidden = YES;
+    });
+}
+
+static void DDDebugLog(NSString *format, ...) {
+    if (!format) return;
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gDDForwardDebugBuffer) gDDForwardDebugBuffer = [NSMutableString string];
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss.SSS";
+        [gDDForwardDebugBuffer appendFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], message];
+        if (gDDForwardDebugBuffer.length > 60000) {
+            [gDDForwardDebugBuffer deleteCharactersInRange:NSMakeRange(0, gDDForwardDebugBuffer.length - 60000)];
+        }
+        DDDebugShow();
+        [gDDForwardDebugPanel refreshText];
+    });
+}
+
+static void DDDebugStartSession(NSString *reason) {
+    gDDForwardDebugUserClosed = NO;
+    if (!gDDForwardDebugBuffer) gDDForwardDebugBuffer = [NSMutableString string];
+    [gDDForwardDebugBuffer setString:@""];
+    DDDebugShow();
+    DDDebugLog(@"==== DDForward debug start: %@ ====", reason ? reason : @"unknown");
+    DDDebugLog(@"deviceScale=%.2f screen=%@ keyWindow=%@", [UIScreen mainScreen].scale, NSStringFromCGRect([UIScreen mainScreen].bounds), DDObjectSummary([NSObject currentKeyWindow]));
+}
+
+static void DDDebugCaptureState(NSString *reason) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        DDDebugLog(@"---- capture: %@ ----", reason ? reason : @"unknown");
+        NSMutableString *snapshot = [NSMutableString string];
+        UIWindow *keyWindow = [NSObject currentKeyWindow];
+        [snapshot appendFormat:@"keyWindow: %@\n", DDObjectSummary(keyWindow)];
+        NSMutableArray *windows = [NSMutableArray array];
+        if (keyWindow) [windows addObject:keyWindow];
+        for (UIScene *scene in [[UIApplication sharedApplication].connectedScenes copy]) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *window in [((UIWindowScene *)scene).windows copy]) {
+                if (window == gDDForwardDebugWindow) continue;
+                if (!window || [windows containsObject:window]) continue;
+                [windows addObject:window];
+            }
+        }
+        NSUInteger wi = 0;
+        for (UIWindow *window in windows) {
+            [snapshot appendFormat:@"window[%lu]: %@\n", (unsigned long)wi, DDObjectSummary(window)];
+            NSMutableArray *targets = [NSMutableArray array];
+            for (UIView *subview in [window.subviews copy]) {
+                DDCollectRelevantViews(subview, targets);
+            }
+            NSUInteger ti = 0;
+            for (UIView *target in targets) {
+                [snapshot appendFormat:@"target[%lu.%lu]: %@ residue=%d\n", (unsigned long)wi, (unsigned long)ti, DDObjectSummary(target), DDIsForwardSightResidueContainer(target, window)];
+                DDAppendViewTree(snapshot, target, 1, 4);
+                ti++;
+                if (ti >= 12) break;
+            }
+            wi++;
+        }
+        DDDebugLog(@"%@", snapshot);
+    });
+}
+
+static void DDDebugScheduleCaptures(NSString *reason) {
+    DDDebugCaptureState(reason);
+    NSArray *delays = @[@0.25, @0.8, @1.5, @2.5, @4.0, @7.0, @10.0];
+    for (NSNumber *delay in delays) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            DDDebugCaptureState([NSString stringWithFormat:@"%@ +%@s", reason ? reason : @"capture", delay]);
         });
     }
 }
@@ -555,12 +906,12 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 - (UIViewController *)dd_instantiateSightEditVC:(Class)editCls localPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
     // 不同版本可能存在不同的 init 签名，按"信息越完整越优先"顺序尝试
     NSDictionary *sightInfoDict = @{
-        @"moviePath": localPath ?: @"",
-        @"realMoviePath": localPath ?: @"",
-        @"videoPath": localPath ?: @"",
-        @"sightPath": localPath ?: @"",
-        @"thumbImage": thumbImage ?: [NSNull null],
-        @"realThumbImage": thumbImage ?: [NSNull null],
+        @"moviePath": localPath ? localPath : @"",
+        @"realMoviePath": localPath ? localPath : @"",
+        @"videoPath": localPath ? localPath : @"",
+        @"sightPath": localPath ? localPath : @"",
+        @"thumbImage": thumbImage ? thumbImage : [NSNull null],
+        @"realThumbImage": thumbImage ? thumbImage : [NSNull null],
     };
     
     UIViewController *vc = nil;
@@ -617,6 +968,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 // 构造 SightDraftItem（视频项，包含路径/缩略图/mode）
 - (id)dd_buildSightDraftItemWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
     Class itemCls = NSClassFromString(@"SightDraftItem");
+    DDDebugLog(@"build SightDraftItem class=%@ localPath=%@ thumb=%@", itemCls ? NSStringFromClass(itemCls) : @"nil", localPath ? localPath : @"nil", DDObjectSummary(thumbImage));
     if (!itemCls || localPath.length == 0) return nil;
     
     id item = nil;
@@ -627,7 +979,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         @try {
             item = ((id (*)(Class, SEL, id, id, unsigned long long))objc_msgSend)(
                 itemCls, clsSel,
-                thumbImage ?: (id)[NSNull null],
+                thumbImage ? thumbImage : (id)[NSNull null],
                 localPath,
                 (unsigned long long)0
             );
@@ -649,11 +1001,19 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         }
     }
     
+    DDDebugLog(@"SightDraftItem result=%@ videoPath=%@ moviePath=%@ videoDraftPath=%@ thumbImg=%@ mode=%@",
+               DDObjectSummary(item),
+               DDKVCValueSummary(item, @"videoPath"),
+               DDKVCValueSummary(item, @"moviePath"),
+               DDKVCValueSummary(item, @"videoDraftPath"),
+               DDKVCValueSummary(item, @"thumbImg"),
+               DDKVCValueSummary(item, @"mode"));
     return item;
 }
 
 - (id)dd_buildSightDraftWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
     Class draftCls = NSClassFromString(@"SightDraft");
+    DDDebugLog(@"build SightDraft class=%@ localPath=%@ thumb=%@", draftCls ? NSStringFromClass(draftCls) : @"nil", localPath ? localPath : @"nil", DDObjectSummary(thumbImage));
     if (!draftCls || localPath.length == 0) return nil;
     
     NSURL *videoURL = [NSURL fileURLWithPath:localPath];
@@ -710,6 +1070,12 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         @try { [draft setValue:localPath forKey:@"draftItemVideoPath"]; } @catch (__unused NSException *e) {}
     }
     
+    DDDebugLog(@"SightDraft result=%@ itemAry=%@ sightDraft=%@ draftItemVideoPath=%@ type=%@",
+               DDObjectSummary(draft),
+               DDKVCValueSummary(draft, @"itemAry"),
+               DDKVCValueSummary(draft, @"sightDraft"),
+               DDKVCValueSummary(draft, @"draftItemVideoPath"),
+               DDKVCValueSummary(draft, @"type"));
     return draft;
 }
 
@@ -717,6 +1083,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     UIViewController *presenter = nil;
     UINavigationController *sourceNav = nil;
     @try { sourceNav = [self valueForKey:@"navigationController"]; } @catch (__unused NSException *e) {}
+    DDDebugLog(@"presentEditVC begin editVC=%@ sourceNav=%@", DDObjectSummary(editVC), DDObjectSummary(sourceNav));
     if (sourceNav) {
         presenter = sourceNav;
         while (presenter.presentedViewController) presenter = presenter.presentedViewController;
@@ -738,12 +1105,17 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     }
     wrap.modalPresentationStyle = UIModalPresentationFullScreen;
     objc_setAssociatedObject(wrap, "dd_isForwardModalNavigationController", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [presenter presentViewController:wrap animated:YES completion:nil];
+    DDDebugLog(@"presentEditVC presenter=%@ wrap=%@ wrapRoot=%@", DDObjectSummary(presenter), DDObjectSummary(wrap), DDObjectSummary(editVC));
+    [presenter presentViewController:wrap animated:YES completion:^{
+        DDDebugLog(@"presentEditVC completion editVC=%@ nav=%@", DDObjectSummary(editVC), DDObjectSummary(editVC.navigationController));
+        DDDebugScheduleCaptures(@"after-present-editVC");
+    }];
     return YES;
 }
 
 - (BOOL)dd_tryForwardSightWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage {
     Class commitCls = NSClassFromString(@"WCNewCommitViewController");
+    DDDebugLog(@"tryForwardSight commitCls=%@ localPath=%@ thumb=%@", commitCls ? NSStringFromClass(commitCls) : @"nil", localPath ? localPath : @"nil", DDObjectSummary(thumbImage));
     if (!commitCls) return NO;
     
     // 1) 构造 SightDraft（8.0.71 头文件确认为视频发布的标准载体）
@@ -752,6 +1124,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     
     // 2) 用 -initWithSightDraft: 启动 VC（8.0.71 头文件确认的唯一视频专用 init）
     SEL initSel = NSSelectorFromString(@"initWithSightDraft:");
+    DDDebugLog(@"tryForwardSight initWithSightDraft exists=%d", [commitCls instancesRespondToSelector:initSel]);
     if (![commitCls instancesRespondToSelector:initSel]) return NO;
     
     UIViewController *editVC = nil;
@@ -759,6 +1132,11 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         editVC = ((id (*)(id, SEL, id))objc_msgSend)([commitCls alloc], initSel, sightDraft);
     } @catch (__unused NSException *e) {}
     if (!editVC) return NO;
+    DDDebugLog(@"tryForwardSight editVC=%@ sightDraft=%@ vc.sightDraft=%@ vc.type=%@",
+               DDObjectSummary(editVC),
+               DDObjectSummary(sightDraft),
+               DDKVCValueSummary(editVC, @"sightDraft"),
+               DDKVCValueSummary(editVC, @"type"));
     
     // 3) 如果 initWithSightDraft: 内部未主动 set，手动补上 sightDraft
     SEL setDraftSel = NSSelectorFromString(@"setSightDraft:");
@@ -773,6 +1151,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     
     // 6) 打标：标记此 VC 是由转发流程启动，hook 中据此强制退出（避免发布后卡死）
     objc_setAssociatedObject(editVC, "dd_isForwardLaunched", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    DDDebugLog(@"tryForwardSight marked editVC forward flag; type=%@ hasClickDone=%@", DDKVCValueSummary(editVC, @"type"), DDKVCValueSummary(editVC, @"hasClickDone"));
     
     return [self dd_presentEditVC:editVC];
 }
@@ -789,10 +1168,21 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     
     DDForwardConfig *cfg = [DDForwardConfig sharedConfig];
     if (!cfg.forwardEnabled) return;
+
+    DDDebugStartSession(@"tap-forward-button");
+    DDDebugLog(@"forward entry self=%@ sender=%@ dataItem=%@ contentObj=%@ mediaList=%@ nav=%@",
+               DDObjectSummary(self),
+               DDObjectSummary(sender),
+               DDObjectSummary(dataItem),
+               DDObjectSummary([dataItem contentObj]),
+               DDKVCValueSummary([dataItem contentObj], @"mediaList"),
+               DDKVCValueSummary(self, @"navigationController"));
+    DDDebugScheduleCaptures(@"forward-entry");
     
     [self showLoadingHUD];
     [self downloadAllMediaForDataItem:dataItem completion:^{
         BOOL hasSight = [self dd_dataItemContainsSight:dataItem];
+        DDDebugLog(@"download completion hasSight=%d dataItem=%@ contentObj=%@", hasSight, DDObjectSummary(dataItem), DDObjectSummary([dataItem contentObj]));
         
         if (hasSight) {
             // 视频朋友圈：使用本地视频文件重新走"发布朋友圈"流程，迫使微信重新上传
@@ -800,15 +1190,24 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
             id sightItem = [self dd_firstSightMediaItemForDataItem:dataItem];
             NSString *localPath = [self dd_localVideoPathForMediaItem:sightItem];
             UIImage *thumbImage = [self dd_localThumbImageForMediaItem:sightItem];
+            DDDebugLog(@"sight media item=%@ localPath=%@ fileExists=%d thumb=%@ hasData=%@ hasSight=%@",
+                       DDObjectSummary(sightItem),
+                       localPath ? localPath : @"nil",
+                       localPath ? [[NSFileManager defaultManager] fileExistsAtPath:localPath] : NO,
+                       DDObjectSummary(thumbImage),
+                       DDKVCValueSummary(sightItem, @"hasData"),
+                       DDKVCValueSummary(sightItem, @"hasSight"));
             
             [self hideLoadingHUD];
             
             if (!localPath) {
+                DDDebugLog(@"abort: localPath nil");
                 [self dd_showSimpleAlert:@"视频本地缓存未就绪：请先点击进入这条朋友圈让视频自动下载完成后再次尝试转发。"];
                 return;
             }
             
             BOOL ok = [self dd_tryForwardSightWithLocalPath:localPath thumbImage:thumbImage];
+            DDDebugLog(@"tryForwardSight returned=%d", ok);
             if (!ok) {
                 [self dd_showSimpleAlert:@"未匹配到当前微信版本的视频发布入口类。\n请使用 FLEX 抓取实际类名后反馈给开发者补全适配。"];
             }
@@ -945,7 +1344,10 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         UIWindow *window = strongSelf.window;
         if (!window) window = [NSObject currentKeyWindow];
         if (DDIsForwardSightResidueContainer(strongSelf, window)) {
+            DDDebugLog(@"UIView didMoveToSuperview residue hit: %@", DDObjectSummary(strongSelf));
+            DDDebugCaptureState(@"residue-hit-before-remove");
             [strongSelf removeFromSuperview];
+            DDDebugCaptureState(@"residue-hit-after-remove");
         }
     });
 }
@@ -971,12 +1373,22 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         UIView *commitView = self.view;
         UIView *navView = nav.view;
         BOOL isForwardModalNav = nav ? [objc_getAssociatedObject(nav, "dd_isForwardModalNavigationController") boolValue] : NO;
+        DDDebugLog(@"dismissForwardLaunched begin self=%@ nav=%@ navView=%@ commitView=%@ modalNav=%d presenting=%@",
+                   DDObjectSummary(self),
+                   DDObjectSummary(nav),
+                   DDObjectSummary(navView),
+                   DDObjectSummary(commitView),
+                   isForwardModalNav,
+                   DDObjectSummary(nav.presentingViewController));
+        DDDebugScheduleCaptures(@"dismiss-begin");
         void (^cleanupCommittedView)(void) = ^{
+            DDDebugLog(@"dismiss cleanupCommittedView commitView=%@ navView=%@", DDObjectSummary(commitView), DDObjectSummary(navView));
             [commitView removeFromSuperview];
             if (isForwardModalNav) {
                 [navView removeFromSuperview];
             }
             DDScheduleForwardSightResiduePreviewCleanup();
+            DDDebugScheduleCaptures(@"dismiss-cleanup");
         };
 
         DDScheduleForwardSightResiduePreviewCleanup();
@@ -1029,6 +1441,7 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         if (nav) {
             NSArray *vcs = nav.viewControllers;
             NSUInteger idx = [vcs indexOfObject:(UIViewController *)self];
+            DDDebugLog(@"dismiss nav stack count=%lu idx=%lu vcs=%@", (unsigned long)vcs.count, (unsigned long)idx, vcs);
             void (^finishCleanup)(void) = ^{
                 cleanupCommittedView();
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
@@ -1061,6 +1474,12 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 - (void)didFinishCommiting {
     if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"didFinishCommiting forward self=%@ hasClickDone=%@ type=%@ sightDraft=%@",
+                   DDObjectSummary(self),
+                   DDKVCValueSummary(self, @"hasClickDone"),
+                   DDKVCValueSummary(self, @"type"),
+                   DDKVCValueSummary(self, @"sightDraft"));
+        DDDebugScheduleCaptures(@"didFinishCommiting");
         // 转发场景：baseResultDelegate / imageSelectorController 都为 nil，微信原生
         // 路径 dismiss 会错乲到上游列表（表现为 window 调上残留遮罩导致点击无响应），
         // 这里直接走清理+退出路径，不调 %orig。
@@ -1072,6 +1491,8 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 - (void)didCancelCommiting {
     if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"didCancelCommiting forward self=%@", DDObjectSummary(self));
+        DDDebugScheduleCaptures(@"didCancelCommiting");
         [self dd_dismissForwardLaunched];
         return;
     }
@@ -1080,6 +1501,8 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 - (void)OnReturn {
     if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"OnReturn forward self=%@", DDObjectSummary(self));
+        DDDebugScheduleCaptures(@"OnReturn");
         // 转发流程不走原 OnReturn 的状态机/弹窗，直接强制退出
         [self dd_dismissForwardLaunched];
         return;
@@ -1089,6 +1512,8 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 - (void)doExit {
     if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"doExit forward self=%@", DDObjectSummary(self));
+        DDDebugScheduleCaptures(@"doExit");
         [self dd_dismissForwardLaunched];
         return;
     }
@@ -1102,10 +1527,20 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 - (void)OnDone {
     BOOL isForward = [self dd_isLaunchedByForward];
     if (isForward) {
+        DDDebugLog(@"OnDone before orig self=%@ hasClickDone=%@ type=%@ sightDraft=%@ baseResultDelegate=%@ imageSelectorController=%@",
+                   DDObjectSummary(self),
+                   DDKVCValueSummary(self, @"hasClickDone"),
+                   DDKVCValueSummary(self, @"type"),
+                   DDKVCValueSummary(self, @"sightDraft"),
+                   DDKVCValueSummary(self, @"baseResultDelegate"),
+                   DDKVCValueSummary(self, @"imageSelectorController"));
+        DDDebugScheduleCaptures(@"OnDone-before-orig");
         DDScheduleForwardSightResiduePreviewCleanup();
     }
     %orig;
     if (isForward) {
+        DDDebugLog(@"OnDone after orig self=%@ hasClickDone=%@", DDObjectSummary(self), DDKVCValueSummary(self, @"hasClickDone"));
+        DDDebugScheduleCaptures(@"OnDone-after-orig");
         __weak __typeof(self) weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -1121,10 +1556,19 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 - (void)postNewItemForSight {
     BOOL isForward = [self dd_isLaunchedByForward];
     if (isForward) {
+        DDDebugLog(@"postNewItemForSight before orig self=%@ hasClickDone=%@ type=%@ sightDraft=%@ text=%@",
+                   DDObjectSummary(self),
+                   DDKVCValueSummary(self, @"hasClickDone"),
+                   DDKVCValueSummary(self, @"type"),
+                   DDKVCValueSummary(self, @"sightDraft"),
+                   DDKVCValueSummary(self, @"textView"));
+        DDDebugScheduleCaptures(@"postNewItemForSight-before-orig");
         DDScheduleForwardSightResiduePreviewCleanup();
     }
     %orig;
     if (isForward) {
+        DDDebugLog(@"postNewItemForSight after orig self=%@ hasClickDone=%@", DDObjectSummary(self), DDKVCValueSummary(self, @"hasClickDone"));
+        DDDebugScheduleCaptures(@"postNewItemForSight-after-orig");
         __weak __typeof(self) weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -1142,7 +1586,38 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"viewDidAppear forward self=%@ nav=%@ view=%@ hasClickDone=%@ type=%@",
+                   DDObjectSummary(self),
+                   DDObjectSummary(self.navigationController),
+                   DDObjectSummary(self.view),
+                   DDKVCValueSummary(self, @"hasClickDone"),
+                   DDKVCValueSummary(self, @"type"));
+        DDDebugScheduleCaptures(@"viewDidAppear");
         [self dd_startWatchHasClickDone];
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"viewWillDisappear forward animated=%d self=%@ nav=%@ view=%@",
+                   animated,
+                   DDObjectSummary(self),
+                   DDObjectSummary(self.navigationController),
+                   DDObjectSummary(self.view));
+        DDDebugScheduleCaptures(@"viewWillDisappear");
+    }
+    %orig;
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    %orig;
+    if ([self dd_isLaunchedByForward]) {
+        DDDebugLog(@"viewDidDisappear forward animated=%d self=%@ nav=%@ view=%@",
+                   animated,
+                   DDObjectSummary(self),
+                   DDObjectSummary(self.navigationController),
+                   DDObjectSummary(self.view));
+        DDDebugScheduleCaptures(@"viewDidDisappear");
     }
 }
 
