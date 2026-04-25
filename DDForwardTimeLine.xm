@@ -832,17 +832,68 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 %new
 - (void)dd_dismissForwardLaunched {
     dispatch_async(dispatch_get_main_queue(), ^{
+        // 1) 先清理可能挂在 keyWindow/window 上的悬浮 view，这是“列表卡死”的真正元凶
+        // 根据 WCNewCommitViewController 头文件，以下几个是发布完成后可能仍留在 keyWindow 上的独立 view
+        NSArray *floatingKeys = @[@"deleteBarView", @"animatedFireworksView", @"tigerToastView", @"poiStarView", @"m_sightFullScreenPreviewView", @"ecsView", @"dragTipView"];
+        for (NSString *k in floatingKeys) {
+            @try {
+                id v = [self valueForKey:k];
+                if ([v isKindOfClass:[UIView class]]) {
+                    [(UIView *)v removeFromSuperview];
+                }
+            } @catch (__unused NSException *e) {}
+        }
+        
+        // 2) 关闭保存提示弹窗（MMTipsViewController，可能 modal present 在全局上）
+        @try {
+            id alertVC = [self valueForKey:@"savingAlertView"];
+            if ([alertVC isKindOfClass:[UIViewController class]]) {
+                [(UIViewController *)alertVC dismissViewControllerAnimated:NO completion:nil];
+            }
+        } @catch (__unused NSException *e) {}
+        
+        // 3) 停掉烟花/动画计时器（VC 头文件中 _fireTimer）
+        @try {
+            id timer = [self valueForKey:@"_fireTimer"];
+            if ([timer respondsToSelector:@selector(invalidate)]) {
+                [(NSTimer *)timer invalidate];
+            }
+        } @catch (__unused NSException *e) {}
+        
+        // 4) 兑底清掉 keyWindow 上任何“集中全屏遮罩”（alpha 在透明区间、frame 覆盖整个窗口、且不是 rootViewController.view）
+        UIWindow *kw = [NSObject currentKeyWindow];
+        if (kw) {
+            UIView *rootView = kw.rootViewController.view;
+            for (UIView *sv in [kw.subviews copy]) {
+                if (sv == rootView) continue;
+                CGRect f = sv.frame;
+                BOOL fullscreen = (CGRectGetWidth(f) >= CGRectGetWidth(kw.bounds) - 1
+                                   && CGRectGetHeight(f) >= CGRectGetHeight(kw.bounds) - 1);
+                BOOL semi = (sv.alpha > 0.0 && sv.alpha < 1.0);
+                if (fullscreen && semi) {
+                    [sv removeFromSuperview];
+                }
+            }
+        }
+        
+        // 5) 退出 VC 自身：使用 popToViewController 把 self 及其上可能 push 进去的子页（ImageSelectorController 等）一起退出
         UINavigationController *nav = self.navigationController;
         if (nav) {
-            // VC 是 nav 根视图：把整个 nav modal 关闭；否则 pop 自身
-            if (nav.viewControllers.count > 0 && nav.viewControllers.firstObject == (UIViewController *)self) {
+            NSArray *vcs = nav.viewControllers;
+            NSInteger idx = [vcs indexOfObject:(UIViewController *)self];
+            if (idx != NSNotFound && idx > 0) {
+                [nav popToViewController:vcs[idx - 1] animated:YES];
+            } else if (idx == 0) {
                 if (nav.presentingViewController) {
                     [nav dismissViewControllerAnimated:YES completion:nil];
                 } else {
                     [nav popViewControllerAnimated:YES];
                 }
             } else {
-                [nav popViewControllerAnimated:YES];
+                // self 不在 nav 栈里（已被 pop）——仅需保证上一层 nav 上的子页被 pop
+                if (vcs.count > 1) {
+                    [nav popToRootViewControllerAnimated:YES];
+                }
             }
         } else if (self.presentingViewController) {
             [self.presentingViewController dismissViewControllerAnimated:YES completion:nil];
@@ -851,19 +902,22 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 }
 
 - (void)didFinishCommiting {
-    BOOL isForward = [self dd_isLaunchedByForward];
-    %orig;
-    if (isForward) {
+    if ([self dd_isLaunchedByForward]) {
+        // 转发场景：baseResultDelegate / imageSelectorController 都为 nil，微信原生
+        // 路径 dismiss 会错乲到上游列表（表现为 window 调上残留遮罩导致点击无响应），
+        // 这里直接走清理+退出路径，不调 %orig。
         [self dd_dismissForwardLaunched];
+        return;
     }
+    %orig;
 }
 
 - (void)didCancelCommiting {
-    BOOL isForward = [self dd_isLaunchedByForward];
-    %orig;
-    if (isForward) {
+    if ([self dd_isLaunchedByForward]) {
         [self dd_dismissForwardLaunched];
+        return;
     }
+    %orig;
 }
 
 - (void)OnReturn {
