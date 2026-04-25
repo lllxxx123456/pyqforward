@@ -59,12 +59,16 @@
 
 // 朝友圈发布 VC（视频发布入口）——为 hook 中的 self 提供完整接口声明，避免前向声明导致的 forward declaration 编译错误
 @interface WCNewCommitViewController : UIViewController
+@property (nonatomic) BOOL hasClickDone;
 - (BOOL)dd_isLaunchedByForward;
 - (void)dd_dismissForwardLaunched;
+- (void)dd_startWatchHasClickDone;
 - (void)didFinishCommiting;
 - (void)didCancelCommiting;
 - (void)OnReturn;
+- (void)OnDone;
 - (void)doExit;
+- (void)viewDidAppear:(BOOL)animated;
 @end
 
 // 朋友圈内容与媒体
@@ -122,6 +126,7 @@
 - (BOOL)dd_tryForwardSightWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage;
 - (BOOL)dd_isLaunchedByForward;
 - (void)dd_dismissForwardLaunched;
+- (void)dd_startWatchHasClickDone;
 - (void)xxx_forwordTimeLine:(UIButton *)sender;
 @end
 
@@ -876,6 +881,59 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     if (isForward) {
         [self dd_dismissForwardLaunched];
     }
+}
+
+// 主路径：用户点击导航栏右上“发表”按钮 → OnDone → 发布任务提交后发生。
+// 转发启动的 VC 因缺少 baseResultDelegate/imageSelectorController 上游持有者，
+// 原生 didFinishCommiting 隔该代理 dismiss 不会生效，这里不依赖它，改为在
+// %orig 运行后延迟主动强制 dismiss，与后台 SnsService 上传完全解耦。
+- (void)OnDone {
+    BOOL isForward = [self dd_isLaunchedByForward];
+    %orig;
+    if (isForward) {
+        __weak __typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong __typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf) [strongSelf dd_dismissForwardLaunched];
+        });
+    }
+}
+
+// 兑底：如果某些版本 "发表" 按钮不走 OnDone 而是别的 selector，轮询 hasClickDone
+// hasClickDone 是 WCNewCommitViewController 内部表示“已点发表”的状态位，发表被点击后被置为 YES
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if ([self dd_isLaunchedByForward]) {
+        [self dd_startWatchHasClickDone];
+    }
+}
+
+%new
+- (void)dd_startWatchHasClickDone {
+    static const char *kWatcherKey = "dd_hasClickDoneTimer";
+    if (objc_getAssociatedObject(self, kWatcherKey)) return; // 已启动过
+    __weak __typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { [t invalidate]; return; }
+        BOOL clicked = NO;
+        @try {
+            id v = [strongSelf valueForKey:@"hasClickDone"];
+            clicked = [v respondsToSelector:@selector(boolValue)] ? [v boolValue] : NO;
+        } @catch (__unused NSException *e) {}
+        if (clicked) {
+            [t invalidate];
+            objc_setAssociatedObject(strongSelf, kWatcherKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            __weak __typeof(strongSelf) weakInner = strongSelf;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                __strong __typeof(weakInner) inner = weakInner;
+                if (inner) [inner dd_dismissForwardLaunched];
+            });
+        }
+    }];
+    objc_setAssociatedObject(self, kWatcherKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 %end
