@@ -1,0 +1,9 @@
+Package: com.dd.forwardtimeline
+Name: DD朋友圈转发
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 微信朋友圈一键转发功能
+Maintainer: DD
+Author: DD
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
