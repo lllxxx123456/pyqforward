@@ -67,6 +67,7 @@
 - (void)didCancelCommiting;
 - (void)OnReturn;
 - (void)OnDone;
+- (void)postNewItemForSight;
 - (void)doExit;
 - (void)viewDidAppear:(BOOL)animated;
 @end
@@ -609,10 +610,11 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 
 - (BOOL)dd_presentEditVC:(UIViewController *)editVC {
     UIViewController *presenter = nil;
-    UINavigationController *nav = nil;
-    @try { nav = [self valueForKey:@"navigationController"]; } @catch (__unused NSException *e) {}
-    if (nav) {
-        presenter = nav;
+    UINavigationController *sourceNav = nil;
+    @try { sourceNav = [self valueForKey:@"navigationController"]; } @catch (__unused NSException *e) {}
+    if (sourceNav) {
+        presenter = sourceNav;
+        while (presenter.presentedViewController) presenter = presenter.presentedViewController;
     } else {
         UIWindow *kw = [NSObject currentKeyWindow];
         presenter = kw.rootViewController;
@@ -620,13 +622,18 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     }
     if (!presenter) return NO;
     
-    if ([presenter isKindOfClass:[UINavigationController class]]) {
-        [(UINavigationController *)presenter pushViewController:editVC animated:YES];
-    } else {
-        UINavigationController *wrap = [[UINavigationController alloc] initWithRootViewController:editVC];
-        wrap.modalPresentationStyle = UIModalPresentationFullScreen;
-        [presenter presentViewController:wrap animated:YES completion:nil];
+    Class navCls = NSClassFromString(@"MMUINavigationController");
+    if (!navCls) navCls = [UINavigationController class];
+    UINavigationController *wrap = nil;
+    @try {
+        wrap = [[navCls alloc] initWithRootViewController:editVC];
+    } @catch (__unused NSException *e) {}
+    if (!wrap) {
+        wrap = [[UINavigationController alloc] initWithRootViewController:editVC];
     }
+    wrap.modalPresentationStyle = UIModalPresentationFullScreen;
+    objc_setAssociatedObject(wrap, "dd_isForwardModalNavigationController", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [presenter presentViewController:wrap animated:YES completion:nil];
     return YES;
 }
 
@@ -832,6 +839,17 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 %new
 - (void)dd_dismissForwardLaunched {
     dispatch_async(dispatch_get_main_queue(), ^{
+        UINavigationController *nav = self.navigationController;
+        UIView *commitView = self.view;
+        UIView *navView = nav.view;
+        BOOL isForwardModalNav = nav ? [objc_getAssociatedObject(nav, "dd_isForwardModalNavigationController") boolValue] : NO;
+        void (^cleanupCommittedView)(void) = ^{
+            [commitView removeFromSuperview];
+            if (isForwardModalNav) {
+                [navView removeFromSuperview];
+            }
+        };
+
         // 1) 先清理可能挂在 keyWindow/window 上的悬浮 view，这是“列表卡死”的真正元凶
         // 根据 WCNewCommitViewController 头文件，以下几个是发布完成后可能仍留在 keyWindow 上的独立 view
         NSArray *floatingKeys = @[@"deleteBarView", @"animatedFireworksView", @"tigerToastView", @"poiStarView", @"m_sightFullScreenPreviewView", @"ecsView", @"dragTipView"];
@@ -877,26 +895,35 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
         }
         
         // 5) 退出 VC 自身：使用 popToViewController 把 self 及其上可能 push 进去的子页（ImageSelectorController 等）一起退出
-        UINavigationController *nav = self.navigationController;
         if (nav) {
             NSArray *vcs = nav.viewControllers;
-            NSInteger idx = [vcs indexOfObject:(UIViewController *)self];
-            if (idx != NSNotFound && idx > 0) {
-                [nav popToViewController:vcs[idx - 1] animated:YES];
+            NSUInteger idx = [vcs indexOfObject:(UIViewController *)self];
+            void (^finishCleanup)(void) = ^{
+                cleanupCommittedView();
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), cleanupCommittedView);
+            };
+            if (nav.presentingViewController && (isForwardModalNav || idx == 0)) {
+                [nav dismissViewControllerAnimated:NO completion:finishCleanup];
+            } else if (idx != NSNotFound && idx > 0) {
+                UIViewController *target = [vcs objectAtIndex:idx - 1];
+                [nav popToViewController:target animated:NO];
+                finishCleanup();
             } else if (idx == 0) {
                 if (nav.presentingViewController) {
-                    [nav dismissViewControllerAnimated:YES completion:nil];
+                    [nav dismissViewControllerAnimated:NO completion:finishCleanup];
                 } else {
-                    [nav popViewControllerAnimated:YES];
+                    [nav popViewControllerAnimated:NO];
+                    finishCleanup();
                 }
             } else {
                 // self 不在 nav 栈里（已被 pop）——仅需保证上一层 nav 上的子页被 pop
-                if (vcs.count > 1) {
-                    [nav popToRootViewControllerAnimated:YES];
-                }
+                cleanupCommittedView();
             }
         } else if (self.presentingViewController) {
-            [self.presentingViewController dismissViewControllerAnimated:YES completion:nil];
+            [self.presentingViewController dismissViewControllerAnimated:NO completion:cleanupCommittedView];
+        } else {
+            cleanupCommittedView();
         }
     });
 }
@@ -930,11 +957,11 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
 }
 
 - (void)doExit {
-    BOOL isForward = [self dd_isLaunchedByForward];
-    %orig;
-    if (isForward) {
+    if ([self dd_isLaunchedByForward]) {
         [self dd_dismissForwardLaunched];
+        return;
     }
+    %orig;
 }
 
 // 主路径：用户点击导航栏右上“发表”按钮 → OnDone → 发布任务提交后发生。
@@ -947,6 +974,19 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     if (isForward) {
         __weak __typeof(self) weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong __typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf) [strongSelf dd_dismissForwardLaunched];
+        });
+    }
+}
+
+- (void)postNewItemForSight {
+    BOOL isForward = [self dd_isLaunchedByForward];
+    %orig;
+    if (isForward) {
+        __weak __typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             __strong __typeof(weakSelf) strongSelf = weakSelf;
             if (strongSelf) [strongSelf dd_dismissForwardLaunched];
