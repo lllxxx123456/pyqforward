@@ -1328,28 +1328,30 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     CGFloat commentW = [self buttonWidth:commentBtn];
     CGFloat spacing = commentBtn.frame.origin.x - (likeBtn.frame.origin.x + likeW);
     if (spacing <= 0) spacing = 8.0;
+
+    CGFloat boundsW = CGRectGetWidth(self.bounds);
+    CGFloat shareX = commentBtn.frame.origin.x + commentW + spacing;
+    CGFloat maxShareX = boundsW - commentW;
+    if (maxShareX < 0) maxShareX = 0;
+    if (shareX > maxShareX) shareX = maxShareX;
+    if (shareX < 0) shareX = 0;
     
-    shareBtn.frame = CGRectMake(commentBtn.frame.origin.x + commentW + spacing,
+    shareBtn.frame = CGRectMake(shareX,
                                 commentBtn.frame.origin.y,
                                 commentW,
                                 commentBtn.frame.size.height);
     
     UIImageView *clonedLine = objc_getAssociatedObject(self, @selector(clonedLineView));
     if (clonedLine && clonedLine.superview == self) {
-        CGFloat commentRightCenter = commentBtn.frame.origin.x + commentW;
-        CGFloat lineX = commentRightCenter + spacing / 2 - clonedLine.frame.size.width / 2;
+        CGFloat lineW = clonedLine.frame.size.width;
+        CGFloat lineX = CGRectGetMinX(shareBtn.frame) - spacing / 2 - lineW / 2;
+        CGFloat maxLineX = boundsW - lineW;
+        if (maxLineX < 0) maxLineX = 0;
+        if (lineX > maxLineX) lineX = maxLineX;
+        if (lineX < 0) lineX = 0;
         CGFloat lineY = commentBtn.frame.origin.y + (commentBtn.frame.size.height - clonedLine.frame.size.height) / 2;
         clonedLine.frame = CGRectMake(lineX, lineY,
                                       clonedLine.frame.size.width, clonedLine.frame.size.height);
-    }
-    
-    CGFloat totalW = shareBtn.frame.origin.x + commentW + spacing;
-    CGRect frame = self.frame;
-    frame.size.width = totalW;
-    self.frame = frame;
-    
-    if (self.superview) {
-        self.center = CGPointMake(self.superview.bounds.size.width / 2, self.center.y);
     }
 }
 
