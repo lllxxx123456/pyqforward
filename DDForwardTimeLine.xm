@@ -110,6 +110,8 @@
 - (id)dd_buildSightDraftWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage;
 - (BOOL)dd_presentEditVC:(UIViewController *)editVC;
 - (BOOL)dd_tryForwardSightWithLocalPath:(NSString *)localPath thumbImage:(UIImage *)thumbImage;
+- (BOOL)dd_isLaunchedByForward;
+- (void)dd_dismissForwardLaunched;
 - (void)xxx_forwordTimeLine:(UIButton *)sender;
 @end
 
@@ -642,6 +644,9 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     
     // 5) 缩略图不需手动设置：sightDraft 已包含 thumbImg，VC 会从 draft 里读
     
+    // 6) 打标：标记此 VC 是由转发流程启动，hook 中据此强制退出（避免发布后卡死）
+    objc_setAssociatedObject(editVC, "dd_isForwardLaunched", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    
     return [self dd_presentEditVC:editVC];
 }
 
@@ -792,6 +797,74 @@ static NSString * const kDDRemoveLocationKey = @"DDForward_RemoveLocation";
     
     if (self.superview) {
         self.center = CGPointMake(self.superview.bounds.size.width / 2, self.center.y);
+    }
+}
+
+%end
+
+#pragma mark - Hook 视频发布 VC：转发启动的实例发布/取消/返回时自动退出（避免卡死）
+
+%hook WCNewCommitViewController
+
+// 工具：检测当前 VC 是否由本 tweak 转发流程启动
+%new
+- (BOOL)dd_isLaunchedByForward {
+    id flag = objc_getAssociatedObject(self, "dd_isForwardLaunched");
+    return [flag isKindOfClass:[NSNumber class]] && [(NSNumber *)flag boolValue];
+}
+
+// 工具：强制退出 VC（兼容 push 与 modal 两种呈现方式）
+%new
+- (void)dd_dismissForwardLaunched {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UINavigationController *nav = self.navigationController;
+        if (nav) {
+            // VC 是 nav 根视图：把整个 nav modal 关闭；否则 pop 自身
+            if (nav.viewControllers.count > 0 && nav.viewControllers.firstObject == self) {
+                if (nav.presentingViewController) {
+                    [nav dismissViewControllerAnimated:YES completion:nil];
+                } else {
+                    [nav popViewControllerAnimated:YES];
+                }
+            } else {
+                [nav popViewControllerAnimated:YES];
+            }
+        } else if (self.presentingViewController) {
+            [self.presentingViewController dismissViewControllerAnimated:YES completion:nil];
+        }
+    });
+}
+
+- (void)didFinishCommiting {
+    BOOL isForward = [self dd_isLaunchedByForward];
+    %orig;
+    if (isForward) {
+        [self dd_dismissForwardLaunched];
+    }
+}
+
+- (void)didCancelCommiting {
+    BOOL isForward = [self dd_isLaunchedByForward];
+    %orig;
+    if (isForward) {
+        [self dd_dismissForwardLaunched];
+    }
+}
+
+- (void)OnReturn {
+    if ([self dd_isLaunchedByForward]) {
+        // 转发流程不走原 OnReturn 的状态机/弹窗，直接强制退出
+        [self dd_dismissForwardLaunched];
+        return;
+    }
+    %orig;
+}
+
+- (void)doExit {
+    BOOL isForward = [self dd_isLaunchedByForward];
+    %orig;
+    if (isForward) {
+        [self dd_dismissForwardLaunched];
     }
 }
 
